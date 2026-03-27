@@ -210,7 +210,7 @@ Returns the tail of the most recent task output.
 This plugin changes Claude Code behavior in two ways:
 
 1. `skills/telegram-remote-control/` provides reusable remote-operation instructions.
-2. `hooks/hooks.json` registers a `PreToolUse` hook that calls `scripts/pre_tool_guard.py`.
+2. `hooks/hooks.json` is auto-discovered by Claude Code and registers a `PreToolUse` hook that calls `scripts/pre_tool_guard.py`.
 
 The current guard blocks:
 
@@ -259,7 +259,7 @@ For local testing and development, Claude Code loads this plugin directly from t
 claude --plugin-dir .\telegram
 ```
 
-According to the official Claude Code plugin docs, this is the standard local-development flow for plugin testing, and plugin root components such as `.claude-plugin/plugin.json`, `skills/`, and `hooks/hooks.json` are discovered from that directory.
+According to the official Claude Code plugin docs, this is the standard local-development flow for plugin testing, and plugin root components such as `.claude-plugin/plugin.json`, `skills/`, and the standard `hooks/hooks.json` file are discovered automatically from that directory.
 
 ## Skill Usage
 
