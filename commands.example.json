@@ -1,0 +1,30 @@
+{
+  "git-status": {
+    "argv": [
+      "git",
+      "status",
+      "--short",
+      "--branch"
+    ],
+    "allow_extra_args": false,
+    "timeout_seconds": 60
+  },
+  "git-diff": {
+    "argv": [
+      "git",
+      "diff",
+      "--stat"
+    ],
+    "allow_extra_args": false,
+    "timeout_seconds": 60
+  },
+  "pytest": {
+    "argv": [
+      "python",
+      "-m",
+      "pytest"
+    ],
+    "allow_extra_args": true,
+    "timeout_seconds": 1800
+  }
+}
