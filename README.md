@@ -1,21 +1,26 @@
 # Telegram Remote Control For Claude Code
 
-This directory contains a minimal working scaffold for remotely driving a local Claude Code workflow through a Telegram bot.
+This directory now contains a real Claude Code plugin plus a Telegram bridge for remotely driving a local Claude Code workflow.
 
-This is not a "skill-only" solution. It is made of three parts:
+This is not a "skill-only" solution. It is made of four parts:
 
 1. `bridge.py`
    A local long-running bridge process. It polls Telegram messages, checks authorization, runs local commands, and sends results back.
-2. `skill/`
-   A Claude Code skill that defines the remote-control protocol, compact progress style, and safety boundaries for Telegram-originated work.
-3. `.env.example` and `commands.example.json`
+2. `.claude-plugin/plugin.json`, `settings.json`, `agents/`, `skills/`, and `hooks/`
+   A Claude Code plugin that Claude can load through `--plugin-dir`.
+3. `scripts/pre_tool_guard.py`
+   A hook command that blocks a set of dangerous shell operations before Claude executes them.
+4. `.env.example` and `commands.example.json`
    Example configuration files. Copy them and replace the sample values with real values for your machine.
 
-## Current MVP Features
+## Current Features
 
 - Telegram user allowlist
 - `/help`, `/status`, `/run`, and `/tail`
 - Claude prompt forwarding through a local CLI command template
+- Automatic plugin loading through `--plugin-dir`
+- Default custom agent activation through `settings.json`
+- `PreToolUse` safety hook for risky shell commands
 - Shell command aliases through a whitelist file
 - Local audit logging
 - Single-task execution lock to avoid concurrent writes in one workspace
@@ -24,17 +29,25 @@ This is not a "skill-only" solution. It is made of three parts:
 
 ```text
 telegram/
+|- .claude-plugin/
+|  \- plugin.json
 |- README.md
 |- .env.example
 |- commands.example.json
 |- bridge.py
 |- .gitignore
-\- skill/
-   |- SKILL.md
-   |- agents/
-   |  \- openai.yaml
-   \- references/
-      \- protocol.md
+|- settings.json
+|- agents/
+|  \- remote-operator.md
+|- hooks/
+|  \- hooks.json
+|- scripts/
+|  \- pre_tool_guard.py
+\- skills/
+   \- telegram-remote-control/
+      |- SKILL.md
+      \- references/
+         \- protocol.md
 ```
 
 ## How It Works
@@ -55,7 +68,9 @@ If `CLAUDE_CMD` is:
 claude
 ```
 
-and `CLAUDE_PROMPT_TEMPLATE` is:
+and `CLAUDE_PLUGIN_DIR` points to this directory, the bridge automatically appends `--plugin-dir`.
+
+If `CLAUDE_PROMPT_TEMPLATE` is:
 
 ```text
 You are handling a Telegram remote task in {cwd}. Request from {user}: {prompt}
@@ -64,7 +79,7 @@ You are handling a Telegram remote task in {cwd}. Request from {user}: {prompt}
 the bridge runs a command equivalent to:
 
 ```powershell
-claude "You are handling a Telegram remote task in C:\dev\claude-code. Request from alice: fix the failing tests..."
+claude --plugin-dir C:\dev\claude-code\telegram "You are handling a Telegram remote task in C:\dev\claude-code. Request from alice: fix the failing tests..."
 ```
 
 ### Shell mode
@@ -114,6 +129,8 @@ BOT_TOKEN=123456:replace-me
 ALLOWED_USER_IDS=123456789
 WORKDIR=C:\dev\claude-code
 CLAUDE_CMD=claude
+CLAUDE_ARGS=
+CLAUDE_PLUGIN_DIR=C:\dev\claude-code\telegram
 CLAUDE_PROMPT_TEMPLATE=You are handling a Telegram remote task in {cwd}. Request from {user}: {prompt}
 COMMANDS_FILE=C:\dev\claude-code\telegram\commands.json
 LOG_FILE=C:\dev\claude-code\telegram\bridge.log
@@ -122,13 +139,33 @@ MAX_OUTPUT_CHARS=3500
 DEFAULT_TIMEOUT_SECONDS=900
 ```
 
-### 4. Start the bridge
+### 4. Test the Claude Code plugin locally
+
+```powershell
+claude --plugin-dir .\telegram
+```
+
+Inside Claude Code, verify the plugin loaded:
+
+```text
+/help
+/agents
+/hooks
+```
+
+The plugin should expose:
+
+- skill namespace: `/telegram-remote-control:telegram-remote-control`
+- main-thread agent from `settings.json`
+- a visible `PreToolUse` hook in `/hooks`
+
+### 5. Start the bridge
 
 ```powershell
 python .\telegram\bridge.py
 ```
 
-### 5. Send commands to the bot
+### 6. Send commands to the bot
 
 ```text
 /help
@@ -159,9 +196,29 @@ Runs a configured alias from `commands.json`.
 
 Returns the tail of the most recent task output.
 
+## Plugin Behavior
+
+This plugin changes Claude Code behavior in three ways:
+
+1. `settings.json` activates the `remote-operator` custom agent as the main thread.
+2. `skills/telegram-remote-control/` provides reusable remote-operation instructions.
+3. `hooks/hooks.json` registers a `PreToolUse` hook that calls `scripts/pre_tool_guard.py`.
+
+The current guard blocks:
+
+- `rm -rf`
+- `del /s` or `del /f`
+- `Remove-Item -Recurse -Force`
+- `git reset --hard`
+- `git clean -fd`
+- `git push --force` and `git push --force-with-lease`
+- direct block-device writes
+- disk formatting commands
+- shutdown and reboot commands
+
 ## Security Notes
 
-This MVP already does the following:
+This plugin and bridge already do the following:
 
 - accepts only allowlisted Telegram users
 - blocks arbitrary shell execution
@@ -186,9 +243,19 @@ For a stronger production setup, add these next:
 5. Windows Service or systemd supervision
 6. health checks and retry handling
 
+## How Claude Loads It
+
+For local testing and development, Claude Code loads this plugin directly from the filesystem:
+
+```powershell
+claude --plugin-dir .\telegram
+```
+
+According to the official Claude Code plugin docs, this is the standard local-development flow for plugin testing, and plugin root components such as `.claude-plugin/plugin.json`, `skills/`, `agents/`, `hooks/hooks.json`, and `settings.json` are discovered from that directory.
+
 ## Skill Usage
 
-`telegram/skill/` is the Claude Code skill draft. It does not listen to Telegram by itself. It defines how Claude should behave when work is coming from a Telegram bridge:
+`telegram/skills/telegram-remote-control/` defines how Claude should behave when work is coming from a Telegram bridge:
 
 - interpret remote task origin correctly
 - keep progress messages short
@@ -205,7 +272,8 @@ For a stronger production setup, add these next:
 
 ## Suggested Next Steps
 
-1. wire `CLAUDE_CMD` to the exact Claude CLI invocation used on your machine
-2. tighten argument validation for `commands.json`
+1. install Claude Code CLI on this machine and verify `claude --version`
+2. wire `CLAUDE_CMD` to the exact CLI invocation used locally
 3. add a confirmation flow for risky aliases
-4. run the bridge as a managed service
+4. expand the shell guard to enforce a workspace allowlist
+5. run the bridge as a managed service

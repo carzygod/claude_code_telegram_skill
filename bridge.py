@@ -45,6 +45,9 @@ class TelegramBridge:
         }
         self.workdir = Path(os.environ.get("WORKDIR", str(Path.cwd()))).resolve()
         self.claude_cmd = shlex.split(self.require_env("CLAUDE_CMD"))
+        self.claude_args = shlex.split(os.environ.get("CLAUDE_ARGS", ""))
+        plugin_dir_value = os.environ.get("CLAUDE_PLUGIN_DIR", str(base_dir))
+        self.claude_plugin_dir = Path(plugin_dir_value).resolve()
         self.claude_prompt_template = self.require_env("CLAUDE_PROMPT_TEMPLATE")
         self.commands_file = Path(
             os.environ.get("COMMANDS_FILE", str(base_dir / "commands.json"))
@@ -164,7 +167,10 @@ class TelegramBridge:
             prompt=prompt,
             user=user_label,
         )
-        argv = [*self.claude_cmd, rendered]
+        argv = [*self.claude_cmd, *self.claude_args]
+        if "--plugin-dir" not in argv:
+            argv.extend(["--plugin-dir", str(self.claude_plugin_dir)])
+        argv.append(rendered)
         return self.run_subprocess(argv, self.default_timeout)
 
     def run_alias(self, alias: str, extra_args: list[str]) -> tuple[int, str]:

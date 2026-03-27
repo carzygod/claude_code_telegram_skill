@@ -52,9 +52,8 @@ Proposed command: ...
 
 - Never assume the Telegram bridge has perfect authentication.
 - Re-check intent before destructive actions such as recursive deletes, credential changes, force pushes, or system-wide process control.
-- If the bridge supports command classes, stay within the class attached to the current task.
 - Avoid printing secrets, access tokens, environment dumps, or large unrelated logs.
 
 ## Protocol Reference
 
-Read [references/protocol.md](references/protocol.md) when you need the command contract, expected operator flows, or output formatting expectations for the bridge.
+Read `references/protocol.md` when you need the command contract, expected operator flows, or output formatting expectations for the bridge.

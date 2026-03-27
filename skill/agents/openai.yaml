@@ -1,4 +1,0 @@
-version: 1
-display_name: Telegram Remote Control
-short_description: Remote-control Claude Code through a Telegram bridge with compact progress updates and strict safety boundaries.
-default_prompt: Handle this task as a Telegram-originated remote-control request. Keep updates brief, state the first action, and apply strict safety checks before risky operations.
