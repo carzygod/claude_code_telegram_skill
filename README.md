@@ -1,12 +1,12 @@
 # Telegram Remote Control For Claude Code
 
-This directory now contains a real Claude Code plugin plus a Telegram bridge for remotely driving a local Claude Code workflow.
+This directory now contains a Claude Code plugin plus a Telegram bridge for remotely driving a local Claude Code workflow.
 
 This is not a "skill-only" solution. It is made of four parts:
 
 1. `bridge.py`
    A local long-running bridge process. It polls Telegram messages, checks authorization, runs local commands, and sends results back.
-2. `.claude-plugin/plugin.json`, `settings.json`, `agents/`, `skills/`, and `hooks/`
+2. `.claude-plugin/plugin.json`, `skills/`, and `hooks/`
    A Claude Code plugin that Claude can load through `--plugin-dir`.
 3. `scripts/pre_tool_guard.py`
    A hook command that blocks a set of dangerous shell operations before Claude executes them.
@@ -19,7 +19,6 @@ This is not a "skill-only" solution. It is made of four parts:
 - `/help`, `/status`, `/run`, and `/tail`
 - Claude prompt forwarding through a local CLI command template
 - Automatic plugin loading through `--plugin-dir`
-- Default custom agent activation through `settings.json`
 - `PreToolUse` safety hook for risky shell commands
 - Shell command aliases through a whitelist file
 - Local audit logging
@@ -36,9 +35,6 @@ telegram/
 |- commands.example.json
 |- bridge.py
 |- .gitignore
-|- settings.json
-|- agents/
-|  \- remote-operator.md
 |- hooks/
 |  \- hooks.json
 |- scripts/
@@ -148,7 +144,13 @@ COMMANDS_FILE=/root/cc/claude_code_telegram_skill/commands.json
 LOG_FILE=/root/cc/claude_code_telegram_skill/bridge.log
 ```
 
-### 4. Test the Claude Code plugin locally
+### 4. Validate the plugin
+
+```powershell
+claude plugin validate .\telegram
+```
+
+### 5. Test the Claude Code plugin locally
 
 ```powershell
 claude --plugin-dir .\telegram
@@ -158,23 +160,21 @@ Inside Claude Code, verify the plugin loaded:
 
 ```text
 /help
-/agents
 /hooks
 ```
 
 The plugin should expose:
 
 - skill namespace: `/telegram-remote-control:telegram-remote-control`
-- main-thread agent from `settings.json`
 - a visible `PreToolUse` hook in `/hooks`
 
-### 5. Start the bridge
+### 6. Start the bridge
 
 ```powershell
 python .\telegram\bridge.py
 ```
 
-### 6. Send commands to the bot
+### 7. Send commands to the bot
 
 ```text
 /help
@@ -207,11 +207,10 @@ Returns the tail of the most recent task output.
 
 ## Plugin Behavior
 
-This plugin changes Claude Code behavior in three ways:
+This plugin changes Claude Code behavior in two ways:
 
-1. `settings.json` activates the `remote-operator` custom agent as the main thread.
-2. `skills/telegram-remote-control/` provides reusable remote-operation instructions.
-3. `hooks/hooks.json` registers a `PreToolUse` hook that calls `scripts/pre_tool_guard.py`.
+1. `skills/telegram-remote-control/` provides reusable remote-operation instructions.
+2. `hooks/hooks.json` registers a `PreToolUse` hook that calls `scripts/pre_tool_guard.py`.
 
 The current guard blocks:
 
@@ -260,7 +259,7 @@ For local testing and development, Claude Code loads this plugin directly from t
 claude --plugin-dir .\telegram
 ```
 
-According to the official Claude Code plugin docs, this is the standard local-development flow for plugin testing, and plugin root components such as `.claude-plugin/plugin.json`, `skills/`, `agents/`, `hooks/hooks.json`, and `settings.json` are discovered from that directory.
+According to the official Claude Code plugin docs, this is the standard local-development flow for plugin testing, and plugin root components such as `.claude-plugin/plugin.json`, `skills/`, and `hooks/hooks.json` are discovered from that directory.
 
 ## Skill Usage
 

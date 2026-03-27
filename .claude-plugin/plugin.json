@@ -12,7 +12,6 @@
     "hooks",
     "safety"
   ],
-  "agents": "./agents/",
   "skills": "./skills/",
   "hooks": "./hooks/hooks.json"
 }
