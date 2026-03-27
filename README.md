@@ -139,6 +139,15 @@ MAX_OUTPUT_CHARS=3500
 DEFAULT_TIMEOUT_SECONDS=900
 ```
 
+On Linux, use Linux-style absolute paths instead of the Windows examples above:
+
+```env
+WORKDIR=/root/cc/claude_code_telegram_skill
+CLAUDE_PLUGIN_DIR=/root/cc/claude_code_telegram_skill
+COMMANDS_FILE=/root/cc/claude_code_telegram_skill/commands.json
+LOG_FILE=/root/cc/claude_code_telegram_skill/bridge.log
+```
+
 ### 4. Test the Claude Code plugin locally
 
 ```powershell

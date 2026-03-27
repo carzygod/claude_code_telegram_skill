@@ -72,7 +72,14 @@ class TelegramBridge:
         return value
 
     def configure_logging(self) -> None:
-        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        if self.log_file.exists() and self.log_file.is_dir():
+            self.log_file = self.log_file / "bridge.log"
+        elif self.log_file.suffix == "":
+            # Treat bare paths without a filename extension as directories for robustness.
+            self.log_file.mkdir(parents=True, exist_ok=True)
+            self.log_file = self.log_file / "bridge.log"
+        else:
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
         logging.basicConfig(
             filename=self.log_file,
             level=logging.INFO,
