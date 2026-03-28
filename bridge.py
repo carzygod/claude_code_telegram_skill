@@ -3,15 +3,21 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pty
+import re
+import select
 import shlex
 import subprocess
 import threading
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 def load_dotenv(path: Path) -> None:
@@ -25,6 +31,10 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip())
 
 
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text).replace("\r", "")
+
+
 @dataclass
 class CommandSpec:
     argv: list[str]
@@ -32,10 +42,32 @@ class CommandSpec:
     timeout_seconds: int | None = None
 
 
+@dataclass
+class ClaudeSession:
+    name: str
+    process: subprocess.Popen[bytes]
+    master_fd: int
+    plugin_aliases: list[str]
+    buffer: str = ""
+    output_seq: int = 0
+    last_activity: float = field(default_factory=time.monotonic)
+    reader_thread: threading.Thread | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    condition: threading.Condition = field(default_factory=lambda: threading.Condition(threading.Lock()))
+
+
+@dataclass
+class ChatState:
+    active_session: str | None = None
+    sessions: dict[str, ClaudeSession] = field(default_factory=dict)
+
+
 class TelegramBridge:
     def __init__(self, base_dir: Path) -> None:
-        load_dotenv(base_dir / ".env")
+        if os.name != "posix":
+            raise RuntimeError("This bridge requires a POSIX system because Claude CLI is proxied through a PTY.")
 
+        load_dotenv(base_dir / ".env")
         self.base_dir = base_dir
         self.bot_token = self.require_env("BOT_TOKEN")
         self.allowed_user_ids = {
@@ -46,22 +78,23 @@ class TelegramBridge:
         self.workdir = Path(os.environ.get("WORKDIR", str(Path.cwd()))).resolve()
         self.claude_cmd = shlex.split(self.require_env("CLAUDE_CMD"))
         self.claude_args = shlex.split(os.environ.get("CLAUDE_ARGS", ""))
-        plugin_dir_value = os.environ.get("CLAUDE_PLUGIN_DIR", str(base_dir))
-        self.claude_plugin_dir = Path(plugin_dir_value).resolve()
-        self.claude_prompt_template = self.require_env("CLAUDE_PROMPT_TEMPLATE")
-        self.commands_file = Path(
-            os.environ.get("COMMANDS_FILE", str(base_dir / "commands.json"))
-        )
+        self.base_plugin_dir = Path(os.environ.get("CLAUDE_PLUGIN_DIR", str(base_dir))).resolve()
+        self.commands_file = Path(os.environ.get("COMMANDS_FILE", str(base_dir / "commands.json")))
         self.log_file = Path(os.environ.get("LOG_FILE", str(base_dir / "bridge.log")))
+        self.plugin_registry_file = Path(os.environ.get("PLUGIN_REGISTRY_FILE", str(base_dir / "plugins.json")))
         self.poll_interval = float(os.environ.get("POLL_INTERVAL_SECONDS", "2"))
         self.max_output_chars = int(os.environ.get("MAX_OUTPUT_CHARS", "3500"))
-        self.default_timeout = int(os.environ.get("DEFAULT_TIMEOUT_SECONDS", "900"))
+        self.idle_timeout_seconds = float(os.environ.get("SESSION_IDLE_TIMEOUT_SECONDS", "1.5"))
+        self.command_timeout_seconds = float(os.environ.get("SESSION_COMMAND_TIMEOUT_SECONDS", "120"))
+        self.session_buffer_chars = int(os.environ.get("SESSION_BUFFER_CHARS", "60000"))
 
         self.api_base = f"https://api.telegram.org/bot{self.bot_token}"
         self.offset = 0
-        self.busy_lock = threading.Lock()
-        self.last_output = "No task has run yet."
+        self.state_lock = threading.Lock()
         self.commands = self.load_commands()
+        self.plugin_registry = self.load_plugin_registry()
+        self.chats: dict[int, ChatState] = {}
+        self.last_output = "No session output yet."
 
         self.configure_logging()
 
@@ -75,7 +108,6 @@ class TelegramBridge:
         if self.log_file.exists() and self.log_file.is_dir():
             self.log_file = self.log_file / "bridge.log"
         elif self.log_file.suffix == "":
-            # Treat bare paths without a filename extension as directories for robustness.
             self.log_file.mkdir(parents=True, exist_ok=True)
             self.log_file = self.log_file / "bridge.log"
         else:
@@ -94,20 +126,29 @@ class TelegramBridge:
         commands: dict[str, CommandSpec] = {}
         for alias, spec in raw.items():
             argv = spec.get("argv")
-            if not isinstance(argv, list) or not argv or not all(
-                isinstance(item, str) for item in argv
-            ):
+            if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
                 raise RuntimeError(f"Invalid argv for alias: {alias}")
             commands[alias] = CommandSpec(
                 argv=argv,
                 allow_extra_args=bool(spec.get("allow_extra_args", False)),
-                timeout_seconds=(
-                    int(spec["timeout_seconds"])
-                    if spec.get("timeout_seconds") is not None
-                    else None
-                ),
+                timeout_seconds=int(spec["timeout_seconds"]) if spec.get("timeout_seconds") is not None else None,
             )
         return commands
+
+    def load_plugin_registry(self) -> dict[str, str]:
+        if not self.plugin_registry_file.exists():
+            return {}
+        raw = json.loads(self.plugin_registry_file.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        return {alias: path for alias, path in raw.items() if isinstance(alias, str) and isinstance(path, str)}
+
+    def save_plugin_registry(self) -> None:
+        self.plugin_registry_file.parent.mkdir(parents=True, exist_ok=True)
+        self.plugin_registry_file.write_text(
+            json.dumps(self.plugin_registry, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def api_request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         params = params or {}
@@ -126,87 +167,320 @@ class TelegramBridge:
         self.api_request("sendMessage", {"chat_id": chat_id, "text": safe_text})
 
     def get_updates(self) -> list[dict[str, Any]]:
-        payload = self.api_request(
-            "getUpdates",
-            {"offset": self.offset, "timeout": 25},
-        )
+        payload = self.api_request("getUpdates", {"offset": self.offset, "timeout": 25})
         return payload.get("result", [])
 
-    def format_help(self) -> str:
-        aliases = ", ".join(sorted(self.commands)) if self.commands else "(none)"
-        return (
-            "Commands:\n"
-            "/help - show this help\n"
-            "/status - bridge status\n"
-            "/run <prompt> - send a prompt to local Claude CLI\n"
-            "/run shell:<alias> [args] - run a whitelisted local command\n"
-            "/tail - show the tail of the last task output\n"
-            f"Shell aliases: {aliases}"
-        )
+    def get_chat_state(self, chat_id: int) -> ChatState:
+        with self.state_lock:
+            return self.chats.setdefault(chat_id, ChatState())
 
-    def format_status(self) -> str:
-        aliases = ", ".join(sorted(self.commands)) if self.commands else "(none)"
-        return (
-            "Bridge is online.\n"
-            f"Workdir: {self.workdir}\n"
-            f"Allowed users: {len(self.allowed_user_ids)}\n"
-            f"Shell aliases: {aliases}\n"
-            f"Busy: {'yes' if self.busy_lock.locked() else 'no'}"
-        )
+    def resolve_plugin_path(self, alias: str) -> Path:
+        path = self.plugin_registry.get(alias)
+        if path is None:
+            raise ValueError(f"Unknown plugin alias: {alias}")
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.exists():
+            raise ValueError(f"Plugin path does not exist: {resolved}")
+        return resolved
 
-    def run_subprocess(self, argv: list[str], timeout: int | None) -> tuple[int, str]:
-        proc = subprocess.run(
-            argv,
-            cwd=str(self.workdir),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout or self.default_timeout,
-            shell=False,
-        )
-        combined = (proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")
-        return proc.returncode, combined.strip() or "(no output)"
-
-    def run_claude_prompt(self, prompt: str, user_label: str) -> tuple[int, str]:
-        rendered = self.claude_prompt_template.format(
-            cwd=str(self.workdir),
-            prompt=prompt,
-            user=user_label,
-        )
+    def build_claude_argv(self, plugin_aliases: list[str]) -> list[str]:
         argv = [*self.claude_cmd, *self.claude_args]
         if "--plugin-dir" not in argv:
-            argv.extend(["--plugin-dir", str(self.claude_plugin_dir)])
-        argv.append(rendered)
-        return self.run_subprocess(argv, self.default_timeout)
+            argv.extend(["--plugin-dir", str(self.base_plugin_dir)])
+        for alias in plugin_aliases:
+            argv.extend(["--plugin-dir", str(self.resolve_plugin_path(alias))])
+        return argv
 
-    def run_alias(self, alias: str, extra_args: list[str]) -> tuple[int, str]:
+    def _reader_loop(self, session: ClaudeSession) -> None:
+        try:
+            while True:
+                if session.process.poll() is not None:
+                    ready, _, _ = select.select([session.master_fd], [], [], 0)
+                    if not ready:
+                        break
+                ready, _, _ = select.select([session.master_fd], [], [], 0.5)
+                if not ready:
+                    continue
+                chunk = os.read(session.master_fd, 4096)
+                if not chunk:
+                    break
+                text = strip_ansi(chunk.decode("utf-8", errors="replace"))
+                with session.condition:
+                    session.buffer = (session.buffer + text)[-self.session_buffer_chars :]
+                    session.output_seq += 1
+                    session.last_activity = time.monotonic()
+                    session.condition.notify_all()
+        except OSError:
+            pass
+        finally:
+            with session.condition:
+                session.output_seq += 1
+                session.condition.notify_all()
+
+    def create_session(self, chat_id: int, name: str, plugin_aliases: list[str] | None = None) -> tuple[ClaudeSession, str]:
+        plugin_aliases = list(plugin_aliases or [])
+        master_fd, slave_fd = pty.openpty()
+        argv = self.build_claude_argv(plugin_aliases)
+        process = subprocess.Popen(
+            argv,
+            cwd=str(self.workdir),
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            shell=False,
+            close_fds=True,
+        )
+        os.close(slave_fd)
+        session = ClaudeSession(
+            name=name,
+            process=process,
+            master_fd=master_fd,
+            plugin_aliases=plugin_aliases,
+        )
+        thread = threading.Thread(target=self._reader_loop, args=(session,), daemon=True)
+        session.reader_thread = thread
+        thread.start()
+        chat = self.get_chat_state(chat_id)
+        with self.state_lock:
+            old = chat.sessions.get(name)
+            if old is not None:
+                self.close_session_runtime(old)
+            chat.sessions[name] = session
+            chat.active_session = name
+        banner = self.collect_output(session, start_seq=0, timeout=15)
+        return session, banner or f"Started Claude session '{name}'."
+
+    def close_session_runtime(self, session: ClaudeSession) -> None:
+        try:
+            if session.process.poll() is None:
+                session.process.terminate()
+                try:
+                    session.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    session.process.kill()
+        finally:
+            try:
+                os.close(session.master_fd)
+            except OSError:
+                pass
+
+    def get_active_session(self, chat_id: int) -> ClaudeSession | None:
+        chat = self.get_chat_state(chat_id)
+        if chat.active_session is None:
+            return None
+        session = chat.sessions.get(chat.active_session)
+        if session and session.process.poll() is not None:
+            return None
+        return session
+
+    def ensure_active_session(self, chat_id: int) -> tuple[ClaudeSession, str]:
+        session = self.get_active_session(chat_id)
+        if session is not None:
+            return session, ""
+        return self.create_session(chat_id, "default")
+
+    def collect_output(self, session: ClaudeSession, start_seq: int, timeout: float | None = None) -> str:
+        timeout = timeout or self.command_timeout_seconds
+        start_len = len(session.buffer)
+        deadline = time.monotonic() + timeout
+        last_change = time.monotonic()
+        seen_change = False
+        with session.condition:
+            current_seq = start_seq
+            while time.monotonic() < deadline:
+                if session.output_seq != current_seq:
+                    current_seq = session.output_seq
+                    seen_change = True
+                    last_change = time.monotonic()
+                if seen_change and (time.monotonic() - last_change) >= self.idle_timeout_seconds:
+                    break
+                if session.process.poll() is not None and not seen_change:
+                    break
+                session.condition.wait(timeout=0.2)
+        return session.buffer[start_len:].strip()
+
+    def send_to_claude(self, session: ClaudeSession, text: str) -> str:
+        with session.lock:
+            baseline = session.output_seq
+            os.write(session.master_fd, (text.rstrip("\n") + "\n").encode("utf-8"))
+            output = self.collect_output(session, baseline)
+        self.last_output = output[-self.max_output_chars :] if output else "(no output)"
+        return self.last_output
+
+    def run_alias(self, alias: str, extra_args: list[str]) -> str:
         spec = self.commands.get(alias)
         if spec is None:
             raise ValueError(f"Unknown shell alias: {alias}")
         if extra_args and not spec.allow_extra_args:
             raise ValueError(f"Alias does not accept extra args: {alias}")
-        argv = [*spec.argv, *extra_args]
-        return self.run_subprocess(argv, spec.timeout_seconds)
+        proc = subprocess.run(
+            [*spec.argv, *extra_args],
+            cwd=str(self.workdir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=spec.timeout_seconds or self.command_timeout_seconds,
+            shell=False,
+        )
+        combined = ((proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")).strip()
+        output = combined or "(no output)"
+        self.last_output = output[-self.max_output_chars :]
+        return f"Exit code: {proc.returncode}\n\n{self.last_output}"
 
-    def handle_run(self, command_text: str, user_label: str) -> str:
-        payload = command_text.strip()
-        if not payload:
-            return "Usage: /run <prompt> or /run shell:<alias> [args]"
+    def format_help(self) -> str:
+        return (
+            "Telegram bridge commands:\n"
+            "/tg-help\n"
+            "/tg-status\n"
+            "/tg-new [name]\n"
+            "/tg-use <name>\n"
+            "/tg-sessions\n"
+            "/tg-close [name]\n"
+            "/tg-restart [name]\n"
+            "/tg-tail\n"
+            "/tg-plugins list|active|add <alias> <path>|remove <alias>|enable <alias>|disable <alias>|clear|validate <alias>\n"
+            "/tg-shell <alias> [args]\n"
+            "Any other text, including Claude slash commands like /help or /model, is forwarded directly into the active Claude CLI session."
+        )
 
-        if payload.startswith("shell:"):
-            shell_command = payload[len("shell:") :].strip()
-            parts = shlex.split(shell_command)
-            if not parts:
-                return "Usage: /run shell:<alias> [args]"
-            alias, *extra_args = parts
-            code, output = self.run_alias(alias, extra_args)
-        else:
-            code, output = self.run_claude_prompt(payload, user_label)
+    def format_status(self, chat_id: int) -> str:
+        chat = self.get_chat_state(chat_id)
+        active = chat.active_session or "(none)"
+        sessions = ", ".join(sorted(chat.sessions)) if chat.sessions else "(none)"
+        return (
+            "Bridge is online.\n"
+            f"Workdir: {self.workdir}\n"
+            f"Active session: {active}\n"
+            f"Sessions: {sessions}\n"
+            f"Registered plugin aliases: {', '.join(sorted(self.plugin_registry)) or '(none)'}"
+        )
 
-        trimmed = output[-self.max_output_chars :]
-        self.last_output = trimmed
-        return f"Exit code: {code}\n\n{trimmed}"
+    def handle_tg_plugins(self, chat_id: int, text: str) -> str:
+        parts = shlex.split(text)
+        chat = self.get_chat_state(chat_id)
+        if len(parts) == 2 and parts[1] == "list":
+            if not self.plugin_registry:
+                return "No extra plugin aliases registered."
+            return "\n".join(f"{alias}: {path}" for alias, path in sorted(self.plugin_registry.items()))
+        if len(parts) == 2 and parts[1] == "active":
+            session = self.get_active_session(chat_id)
+            aliases = session.plugin_aliases if session else []
+            return "Active extra plugins: " + (", ".join(aliases) if aliases else "(none)")
+        if len(parts) >= 4 and parts[1] == "add":
+            alias = parts[2]
+            path = str(Path(parts[3]).expanduser().resolve())
+            self.plugin_registry[alias] = path
+            self.save_plugin_registry()
+            return f"Registered plugin alias '{alias}' -> {path}"
+        if len(parts) >= 3 and parts[1] == "remove":
+            alias = parts[2]
+            if alias not in self.plugin_registry:
+                return f"Unknown plugin alias: {alias}"
+            self.plugin_registry.pop(alias)
+            self.save_plugin_registry()
+            for session in chat.sessions.values():
+                session.plugin_aliases = [item for item in session.plugin_aliases if item != alias]
+            return f"Removed plugin alias '{alias}'."
+        if len(parts) >= 3 and parts[1] in {"enable", "disable"}:
+            session = self.get_active_session(chat_id)
+            if session is None:
+                return "No active Claude session. Create one first with /tg-new."
+            alias = parts[2]
+            if parts[1] == "enable":
+                self.resolve_plugin_path(alias)
+                aliases = list(session.plugin_aliases)
+                if alias not in aliases:
+                    aliases.append(alias)
+            else:
+                aliases = [item for item in session.plugin_aliases if item != alias]
+            name = session.name
+            self.close_session_runtime(session)
+            with self.state_lock:
+                chat.sessions.pop(name, None)
+            _, banner = self.create_session(chat_id, name, aliases)
+            return f"Restarted session '{name}' with plugins: {', '.join(aliases) or '(none)'}\n\n{banner[-2000:]}"
+        if len(parts) == 2 and parts[1] == "clear":
+            session = self.get_active_session(chat_id)
+            if session is None:
+                return "No active Claude session."
+            name = session.name
+            self.close_session_runtime(session)
+            with self.state_lock:
+                chat.sessions.pop(name, None)
+            _, banner = self.create_session(chat_id, name, [])
+            return f"Restarted session '{name}' with no extra plugins.\n\n{banner[-2000:]}"
+        if len(parts) >= 3 and parts[1] == "validate":
+            path = self.resolve_plugin_path(parts[2])
+            return f"Plugin alias '{parts[2]}' resolved to {path}"
+        return "Usage: /tg-plugins list|active|add <alias> <path>|remove <alias>|enable <alias>|disable <alias>|clear|validate <alias>"
+
+    def handle_bridge_command(self, chat_id: int, text: str) -> str:
+        parts = shlex.split(text)
+        if parts[0] == "/tg-help":
+            return self.format_help()
+        if parts[0] == "/tg-status":
+            return self.format_status(chat_id)
+        if parts[0] == "/tg-tail":
+            return self.last_output
+        if parts[0] == "/tg-new":
+            name = parts[1] if len(parts) >= 2 else "default"
+            _, banner = self.create_session(chat_id, name)
+            return banner[-self.max_output_chars :]
+        if parts[0] == "/tg-use":
+            if len(parts) < 2:
+                return "Usage: /tg-use <name>"
+            chat = self.get_chat_state(chat_id)
+            session = chat.sessions.get(parts[1])
+            if session is None or session.process.poll() is not None:
+                return f"Unknown or closed session: {parts[1]}"
+            chat.active_session = parts[1]
+            return f"Switched to session '{parts[1]}'."
+        if parts[0] == "/tg-sessions":
+            chat = self.get_chat_state(chat_id)
+            if not chat.sessions:
+                return "No Claude sessions yet."
+            lines = []
+            for name, session in sorted(chat.sessions.items()):
+                marker = "*" if chat.active_session == name else "-"
+                status = "running" if session.process.poll() is None else "closed"
+                plugins = ", ".join(session.plugin_aliases) if session.plugin_aliases else "(none)"
+                lines.append(f"{marker} {name}: {status}; plugins={plugins}")
+            return "\n".join(lines)
+        if parts[0] == "/tg-close":
+            chat = self.get_chat_state(chat_id)
+            name = parts[1] if len(parts) >= 2 else chat.active_session
+            if not name:
+                return "No active session."
+            session = chat.sessions.get(name)
+            if session is None:
+                return f"Unknown session: {name}"
+            self.close_session_runtime(session)
+            with self.state_lock:
+                chat.sessions.pop(name, None)
+                if chat.active_session == name:
+                    chat.active_session = next(iter(chat.sessions), None)
+            return f"Closed session '{name}'."
+        if parts[0] == "/tg-restart":
+            chat = self.get_chat_state(chat_id)
+            name = parts[1] if len(parts) >= 2 else chat.active_session
+            if not name:
+                return "No active session."
+            session = chat.sessions.get(name)
+            aliases = session.plugin_aliases if session else []
+            if session is not None:
+                self.close_session_runtime(session)
+                with self.state_lock:
+                    chat.sessions.pop(name, None)
+            _, banner = self.create_session(chat_id, name, aliases)
+            return banner[-self.max_output_chars :]
+        if parts[0] == "/tg-shell":
+            if len(parts) < 2:
+                return "Usage: /tg-shell <alias> [args]"
+            return self.run_alias(parts[1], parts[2:])
+        if parts[0] == "/tg-plugins":
+            return self.handle_tg_plugins(chat_id, text)
+        return "Unknown bridge command. Use /tg-help."
 
     def authorize(self, message: dict[str, Any]) -> bool:
         from_user = message.get("from") or {}
@@ -218,57 +492,25 @@ class TelegramBridge:
         chat_id = chat.get("id")
         if not isinstance(chat_id, int):
             return
-
         if not self.authorize(message):
             self.send_message(chat_id, "Access denied.")
-            logging.warning("Denied access for message: %s", message)
             return
-
         text = (message.get("text") or "").strip()
-        from_user = message.get("from") or {}
-        user_label = (
-            from_user.get("username")
-            or from_user.get("first_name")
-            or str(from_user.get("id", "unknown"))
-        )
-
         if not text:
             self.send_message(chat_id, "Only text commands are supported.")
             return
-
-        if text == "/help" or text == "/start":
-            self.send_message(chat_id, self.format_help())
-            return
-        if text == "/status":
-            self.send_message(chat_id, self.format_status())
-            return
-        if text == "/tail":
-            self.send_message(chat_id, self.last_output)
-            return
-        if not text.startswith("/run"):
-            self.send_message(chat_id, "Unknown command. Use /help.")
-            return
-
-        if not self.busy_lock.acquire(blocking=False):
-            self.send_message(chat_id, "A task is already running. Wait for it to finish.")
-            return
-
         try:
-            self.send_message(chat_id, "Task accepted. Running on the local machine.")
-            run_text = text[len("/run") :].strip()
-            logging.info("Running task from %s: %s", user_label, run_text)
-            result = self.handle_run(run_text, user_label)
-            self.send_message(chat_id, result)
-        except subprocess.TimeoutExpired:
-            self.last_output = "Task timed out."
-            self.send_message(chat_id, "Task timed out.")
-            logging.exception("Task timed out")
+            if text.startswith("/tg-"):
+                self.send_message(chat_id, self.handle_bridge_command(chat_id, text))
+                return
+            session, banner = self.ensure_active_session(chat_id)
+            if banner:
+                self.send_message(chat_id, banner[-self.max_output_chars :])
+            output = self.send_to_claude(session, text)
+            self.send_message(chat_id, output or "(no output)")
         except Exception as exc:
-            self.last_output = f"Task failed: {exc}"
+            logging.exception("Failed to process message")
             self.send_message(chat_id, f"Task failed: {exc}")
-            logging.exception("Task failed")
-        finally:
-            self.busy_lock.release()
 
     def serve_forever(self) -> None:
         logging.info("Bridge started in %s", self.workdir)

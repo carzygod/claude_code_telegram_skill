@@ -1,4 +1,6 @@
 .env
 commands.json
 bridge.log
+sessions.json
+plugins.json
 __pycache__/
