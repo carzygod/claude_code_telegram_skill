@@ -21,6 +21,19 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)")
 NONPRINT_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 LINE_ART_RE = re.compile(r"^[\s\-\|╭╮╰╯│─┌┐└┘▐▛▜▌▝▘█◐?·]+$")
+JUNK_SUBSTRINGS = (
+    "]0;",
+    "claudecodev",
+    "tipsforgettingstarted",
+    "welcomeback",
+    "recentactivity",
+    "norecentactivity",
+    "apiusagebilling",
+    "forshortcuts",
+    "/effort",
+    "medium/effort",
+    "[>0q",
+)
 
 
 def load_dotenv(path: Path) -> None:
@@ -47,15 +60,6 @@ def normalize_terminal_output(text: str) -> str:
     text = text.replace("❯", "\n")
     raw_lines = [line.strip() for line in text.splitlines()]
     cleaned: list[str] = []
-    skip_prefixes = (
-        "Claude Code",
-        "Tips for getting started",
-        "Welcome back!",
-        "Recent activity",
-        "No recent activity",
-        "API Usage",
-        "Billing",
-    )
     for line in raw_lines:
         if not line:
             if cleaned and cleaned[-1] != "":
@@ -64,11 +68,12 @@ def normalize_terminal_output(text: str) -> str:
         compact = "".join(ch for ch in line if not ch.isspace())
         if not compact:
             continue
-        if any(prefix.replace(" ", "").lower() in compact.lower() for prefix in skip_prefixes):
-            continue
-        if compact in {"[>0q", "medium/effort", "/effort"}:
+        lower = compact.lower()
+        if any(token in lower for token in JUNK_SUBSTRINGS):
             continue
         if LINE_ART_RE.match(line):
+            continue
+        if len(set(compact)) <= 3 and len(compact) > 8:
             continue
         cleaned.append(line)
 
@@ -293,7 +298,13 @@ class TelegramBridge:
             chat.sessions[name] = session
             chat.active_session = name
         banner = self.collect_output(session, start_seq=0, timeout=15)
-        return session, banner or f"Started Claude session '{name}'."
+        return session, self.normalize_banner(name, banner)
+
+    def normalize_banner(self, name: str, banner: str) -> str:
+        cleaned = normalize_terminal_output(banner)
+        if not cleaned:
+            return f"Started Claude session '{name}'."
+        return cleaned[-self.max_output_chars :]
 
     def close_session_runtime(self, session: ClaudeSession) -> None:
         try:
