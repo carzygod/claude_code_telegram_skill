@@ -18,6 +18,9 @@ from typing import Any
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)")
+NONPRINT_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+LINE_ART_RE = re.compile(r"^[\s\-\|╭╮╰╯│─┌┐└┘▐▛▜▌▝▘█◐?·]+$")
 
 
 def load_dotenv(path: Path) -> None:
@@ -32,7 +35,49 @@ def load_dotenv(path: Path) -> None:
 
 
 def strip_ansi(text: str) -> str:
-    return ANSI_RE.sub("", text).replace("\r", "")
+    text = OSC_RE.sub("", text)
+    text = ANSI_RE.sub("", text)
+    text = text.replace("\r", "\n")
+    text = NONPRINT_RE.sub("", text)
+    return text
+
+
+def normalize_terminal_output(text: str) -> str:
+    text = strip_ansi(text)
+    text = text.replace("❯", "\n")
+    raw_lines = [line.strip() for line in text.splitlines()]
+    cleaned: list[str] = []
+    skip_prefixes = (
+        "Claude Code",
+        "Tips for getting started",
+        "Welcome back!",
+        "Recent activity",
+        "No recent activity",
+        "API Usage",
+        "Billing",
+    )
+    for line in raw_lines:
+        if not line:
+            if cleaned and cleaned[-1] != "":
+                cleaned.append("")
+            continue
+        compact = "".join(ch for ch in line if not ch.isspace())
+        if not compact:
+            continue
+        if any(prefix.replace(" ", "").lower() in compact.lower() for prefix in skip_prefixes):
+            continue
+        if compact in {"[>0q", "medium/effort", "/effort"}:
+            continue
+        if LINE_ART_RE.match(line):
+            continue
+        cleaned.append(line)
+
+    collapsed: list[str] = []
+    for line in cleaned:
+        if line == "" and collapsed and collapsed[-1] == "":
+            continue
+        collapsed.append(line)
+    return "\n".join(collapsed).strip()
 
 
 @dataclass
@@ -204,7 +249,7 @@ class TelegramBridge:
                 chunk = os.read(session.master_fd, 4096)
                 if not chunk:
                     break
-                text = strip_ansi(chunk.decode("utf-8", errors="replace"))
+                text = chunk.decode("utf-8", errors="replace")
                 with session.condition:
                     session.buffer = (session.buffer + text)[-self.session_buffer_chars :]
                     session.output_seq += 1
@@ -297,14 +342,15 @@ class TelegramBridge:
                 if session.process.poll() is not None and not seen_change:
                     break
                 session.condition.wait(timeout=0.2)
-        return session.buffer[start_len:].strip()
+        return normalize_terminal_output(session.buffer[start_len:])
 
     def send_to_claude(self, session: ClaudeSession, text: str) -> str:
         with session.lock:
             baseline = session.output_seq
             os.write(session.master_fd, (text.rstrip("\n") + "\n").encode("utf-8"))
             output = self.collect_output(session, baseline)
-        self.last_output = output[-self.max_output_chars :] if output else "(no output)"
+        translated = normalize_terminal_output(output)
+        self.last_output = translated[-self.max_output_chars :] if translated else "(no output)"
         return self.last_output
 
     def run_alias(self, alias: str, extra_args: list[str]) -> str:
