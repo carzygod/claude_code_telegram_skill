@@ -33,6 +33,7 @@ JUNK_SUBSTRINGS = (
     "/effort",
     "medium/effort",
     "[>0q",
+    "ctrl+gtoeditinvim",
 )
 
 
@@ -83,6 +84,24 @@ def normalize_terminal_output(text: str) -> str:
             continue
         collapsed.append(line)
     return "\n".join(collapsed).strip()
+
+
+def remove_input_echo(output: str, sent_text: str) -> str:
+    if not output:
+        return output
+    sent = sent_text.strip()
+    if not sent:
+        return output
+    lines = output.splitlines()
+    cleaned: list[str] = []
+    stripped_once = False
+    for line in lines:
+        compact = "".join(ch for ch in line.split())
+        if not stripped_once and compact == "".join(ch for ch in sent.split()):
+            stripped_once = True
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
 
 
 @dataclass
@@ -136,6 +155,7 @@ class TelegramBridge:
         self.max_output_chars = int(os.environ.get("MAX_OUTPUT_CHARS", "3500"))
         self.idle_timeout_seconds = float(os.environ.get("SESSION_IDLE_TIMEOUT_SECONDS", "1.5"))
         self.command_timeout_seconds = float(os.environ.get("SESSION_COMMAND_TIMEOUT_SECONDS", "120"))
+        self.min_response_wait_seconds = float(os.environ.get("MIN_RESPONSE_WAIT_SECONDS", "4.0"))
         self.session_buffer_chars = int(os.environ.get("SESSION_BUFFER_CHARS", "60000"))
 
         self.api_base = f"https://api.telegram.org/bot{self.bot_token}"
@@ -339,6 +359,7 @@ class TelegramBridge:
         timeout = timeout or self.command_timeout_seconds
         start_len = len(session.buffer)
         deadline = time.monotonic() + timeout
+        min_wait_deadline = time.monotonic() + self.min_response_wait_seconds
         last_change = time.monotonic()
         seen_change = False
         with session.condition:
@@ -348,7 +369,11 @@ class TelegramBridge:
                     current_seq = session.output_seq
                     seen_change = True
                     last_change = time.monotonic()
-                if seen_change and (time.monotonic() - last_change) >= self.idle_timeout_seconds:
+                if (
+                    seen_change
+                    and time.monotonic() >= min_wait_deadline
+                    and (time.monotonic() - last_change) >= self.idle_timeout_seconds
+                ):
                     break
                 if session.process.poll() is not None and not seen_change:
                     break
@@ -360,7 +385,7 @@ class TelegramBridge:
             baseline = session.output_seq
             os.write(session.master_fd, (text.rstrip("\n") + "\n").encode("utf-8"))
             output = self.collect_output(session, baseline)
-        translated = normalize_terminal_output(output)
+        translated = remove_input_echo(normalize_terminal_output(output), text)
         self.last_output = translated[-self.max_output_chars :] if translated else "(no output)"
         return self.last_output
 
